@@ -2,6 +2,7 @@
 mod generated;
 
 use super::Input;
+use crate::input::devices::HandSkeleton;
 use crate::openxr_data::{self, Hand, SessionData};
 use HandSkeletonBone::*;
 use glam::{Affine3A, Quat, Vec3};
@@ -21,8 +22,6 @@ impl<C: openxr_data::Compositor> Input<C> {
         hand: Hand,
         transforms: &mut [vr::VRBoneTransform_t],
     ) {
-        use HandSkeletonBone::*;
-
         let pose_data = session_data.input_data.pose_data.get().unwrap();
         let devices = session_data.input_data.devices.read().unwrap();
 
@@ -40,11 +39,36 @@ impl<C: openxr_data::Compositor> Input<C> {
             return;
         };
 
-        let Some(joints) = controller.get_hand_skeleton(&self.openxr, &raw) else {
+        let Some(HandSkeleton {
+            joints,
+            data_source,
+        }) = controller.get_hand_skeleton(&self.openxr, &raw)
+        else {
             self.get_estimated_bones(session_data, space, hand, transforms);
             return;
         };
 
+        let frame_wrist = data_source == xr::HandTrackingDataSourceEXT::CONTROLLER
+            && controller
+                .profile_data
+                .as_ref()
+                .is_some_and(|p| p.frame_wrist_basis);
+        Self::write_tracked_bones(joints, hand, space, transforms, frame_wrist);
+
+        self.skeletal_tracking_level.write().unwrap()[hand as usize - 1] = match data_source {
+            xr::HandTrackingDataSourceEXT::CONTROLLER => vr::EVRSkeletalTrackingLevel::Partial,
+            xr::HandTrackingDataSourceEXT::UNOBSTRUCTED => vr::EVRSkeletalTrackingLevel::Full,
+            _ => unreachable!(),
+        };
+    }
+
+    fn write_tracked_bones(
+        joints: xr::HandJointLocations,
+        hand: Hand,
+        space: vr::EVRSkeletalTransformSpace,
+        transforms: &mut [vr::VRBoneTransform_t],
+        frame_wrist: bool,
+    ) {
         let mut joints: Box<[_]> = joints
             .into_iter()
             .map(|joint_location| {
@@ -97,6 +121,18 @@ impl<C: openxr_data::Compositor> Input<C> {
             FRAC_PI_2,
             0.0,
         ));
+
+        if frame_wrist {
+            // In the Frame controller skeleton the open metacarpals are tilted together
+            // by 25 degrees relative to the OpenVR wrist. Rebase the wrist before
+            // localizing its children. This counter-rotates their parent-space poses
+            // while preserving measured model-space joint positions and finger curl.
+            let angle = 25.0_f32.to_radians();
+            joints[xr::HandJoint::WRIST] *= Affine3A::from_rotation_z(match hand {
+                Hand::Left => -angle,
+                Hand::Right => angle,
+            });
+        }
 
         // OpenXR reports all our bones in "model" space (basically), so we need to
         // convert everything into parent space.
@@ -158,8 +194,6 @@ impl<C: openxr_data::Compositor> Input<C> {
                 transform.orientation = rot.into();
             }
         }
-
-        *self.skeletal_tracking_level.write().unwrap() = vr::EVRSkeletalTrackingLevel::Full;
     }
 
     pub(super) fn get_bone_summary_from_hand_tracking(
@@ -186,7 +220,8 @@ impl<C: openxr_data::Compositor> Input<C> {
             return;
         };
 
-        let Some(joints) = controller.get_hand_skeleton(&self.openxr, &raw) else {
+        let Some(HandSkeleton { joints, .. }) = controller.get_hand_skeleton(&self.openxr, &raw)
+        else {
             self.get_estimated_bone_summary(session_data, summary_type, summary_data, hand);
             return;
         };
@@ -322,7 +357,8 @@ impl<C: openxr_data::Compositor> Input<C> {
         });
 
         finalize_transforms(bone_it, space, transforms);
-        *self.skeletal_tracking_level.write().unwrap() = vr::EVRSkeletalTrackingLevel::Estimated;
+        self.skeletal_tracking_level.write().unwrap()[hand as usize - 1] =
+            vr::EVRSkeletalTrackingLevel::Estimated;
     }
 
     pub(super) fn get_estimated_bone_summary(
@@ -734,6 +770,118 @@ impl SkeletalInputActionData {
                 index_curl,
                 rest_curl,
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_wrist_tests {
+    use super::*;
+
+    // Synthetic wrist-local rotations derived from the bundled OpenVR open-hand poses
+    // with a 25-degree wrist tilt in OpenXR coordinates.
+    // The other joints only need valid rigid transforms to exercise the hierarchy.
+    #[test]
+    fn frame_open_fingers_follow_the_openvr_hand_axis() {
+        for (hand, q, reference) in [
+            (
+                Hand::Left,
+                [0.0888, 0.2039, -0.0262, 0.9746],
+                &generated::left_hand::OPENHAND,
+            ),
+            (
+                Hand::Right,
+                [0.0902, -0.2038, 0.0265, 0.9745],
+                &generated::right_hand::OPENHAND,
+            ),
+        ] {
+            let mut joints = xr::HandJointLocations::default();
+            for j in &mut joints {
+                j.pose = xr::Posef::IDENTITY;
+            }
+            let q = Quat::from_array(q).normalize();
+            joints[xr::HandJoint::MIDDLE_METACARPAL].pose.orientation = xr::Quaternionf {
+                x: q.x,
+                y: q.y,
+                z: q.z,
+                w: q.w,
+            };
+            let mut bones = [vr::VRBoneTransform_t::default(); Count as usize];
+            Input::<crate::compositor::Compositor>::write_tracked_bones(
+                joints,
+                hand,
+                vr::EVRSkeletalTransformSpace::Parent,
+                &mut bones,
+                true,
+            );
+            let index = MiddleFinger0 as usize;
+            let actual = bone_transform_to_glam(bones[index]).1;
+            let expected = bone_transform_to_glam(reference[index]).1.normalize();
+            let error = actual.angle_between(expected).abs().to_degrees();
+            assert!(
+                error < 5.0,
+                "{hand:?}: middle metacarpal differs by {error:.1} degrees"
+            );
+        }
+    }
+
+    #[test]
+    fn rebasing_wrist_preserves_measured_joints_and_finger_curl() {
+        for hand in [Hand::Left, Hand::Right] {
+            for curl in [0.0_f32, 0.65, 1.5] {
+                let mut joints = xr::HandJointLocations::default();
+                for (idx, joint) in joints.iter_mut().enumerate() {
+                    let t = idx as f32;
+                    let q = Quat::from_rotation_y(0.7) * Quat::from_rotation_x(curl * t / 4.0);
+                    joint.pose.orientation = xr::Quaternionf {
+                        x: q.x,
+                        y: q.y,
+                        z: q.z,
+                        w: q.w,
+                    };
+                    joint.pose.position = xr::Vector3f {
+                        x: 0.1,
+                        y: t * 0.002,
+                        z: 0.2 - t * 0.003,
+                    };
+                }
+                for space in [
+                    vr::EVRSkeletalTransformSpace::Parent,
+                    vr::EVRSkeletalTransformSpace::Model,
+                ] {
+                    let convert = |calibrated| {
+                        let mut bones = [vr::VRBoneTransform_t::default(); Count as usize];
+                        Input::<crate::compositor::Compositor>::write_tracked_bones(
+                            joints, hand, space, &mut bones, calibrated,
+                        );
+                        bones
+                    };
+                    let old = convert(false);
+                    let new = convert(true);
+                    for idx in 0..Count as usize {
+                        if idx == Wrist as usize {
+                            continue;
+                        }
+                        if space == vr::EVRSkeletalTransformSpace::Parent
+                            && [
+                                Thumb0,
+                                IndexFinger0,
+                                MiddleFinger0,
+                                RingFinger0,
+                                PinkyFinger0,
+                            ]
+                            .iter()
+                            .any(|&b| b as usize == idx)
+                        {
+                            continue;
+                        }
+                        let (p, q) = bone_transform_to_glam(old[idx]);
+                        let (p2, q2) = bone_transform_to_glam(new[idx]);
+                        assert!(p.distance(p2) < 1e-5, "position {hand:?} {idx}");
+                        assert!(q.dot(q2).abs() > 0.99999, "orientation {hand:?} {idx}");
+                    }
+                }
+            }
         }
     }
 }

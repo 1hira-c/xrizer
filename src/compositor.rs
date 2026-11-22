@@ -1305,6 +1305,7 @@ impl<G: GraphicsBackend> FrameController<G> {
 
             let crate::system::ViewData { flags, views } =
                 system.get_views(session_data.current_origin_as_reference_space());
+            let crop = system.presentation_crop();
             proj_layer_views = views
                 .into_iter()
                 .enumerate()
@@ -1327,18 +1328,18 @@ impl<G: GraphicsBackend> FrameController<G> {
                         flip_vertically,
                     } = self.eyes_submitted[eye_index]
                         .unwrap_or_else(|| panic!("Eye {eye_index} has not been submitted!"));
-                    let mut fov = view.fov;
-                    if flip_vertically {
-                        std::mem::swap(&mut fov.angle_up, &mut fov.angle_down);
-                    }
+                    let (rect, fov) = crop.submitted_view(
+                        system.crop,
+                        eye_index,
+                        extent,
+                        flip_vertically,
+                        view.fov,
+                    );
 
                     let sub_image = xr::SwapchainSubImage::new()
                         .swapchain(&swapchain_data.swapchain)
                         .image_array_index(eye_index as u32)
-                        .image_rect(xr::Rect2Di {
-                            extent,
-                            offset: xr::Offset2Di::default(),
-                        });
+                        .image_rect(rect);
 
                     xr::CompositionLayerProjectionView::new()
                         .fov(fov)

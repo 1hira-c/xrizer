@@ -12,6 +12,9 @@ use openxr as xr;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
+mod fov_crop;
+use fov_crop::{FovCrop, LiveCrop};
+
 #[derive(Copy, Clone)]
 pub struct ViewData {
     pub flags: xr::ViewStateFlags,
@@ -156,6 +159,8 @@ pub struct System {
     overlay: Injected<OverlayMan>,
     vtables: Vtables,
     views: Mutex<ViewCache>,
+    pub(crate) crop: FovCrop,
+    live_crop: Mutex<LiveCrop>,
 }
 
 mod log_tags {
@@ -164,13 +169,23 @@ mod log_tags {
 
 impl System {
     pub fn new(openxr: Arc<RealOpenXrData>, injector: &Injector) -> Self {
+        let crop = FovCrop::from_environment();
         Self {
             openxr,
             input: injector.inject(),
             overlay: injector.inject(),
             vtables: Default::default(),
             views: Mutex::default(),
+            crop,
+            live_crop: Mutex::new(LiveCrop::new(crop)),
         }
+    }
+
+    pub(crate) fn presentation_crop(&self) -> FovCrop {
+        self.live_crop
+            .lock()
+            .unwrap()
+            .read(std::time::Instant::now())
     }
 
     pub fn reset_views(&self) {
@@ -190,7 +205,12 @@ impl System {
         tracy_span!();
         let session = self.openxr.session_data.get();
         let mut views = self.views.lock().unwrap();
-        views.get_views(&session, self.openxr.display_time.get(), ty)
+        let mut data = views.get_views(&session, self.openxr.display_time.get(), ty);
+        // Both the game's projection and the submitted OpenXR layer read these views.
+        for (eye, view) in data.views.iter_mut().enumerate() {
+            view.fov = self.crop.projection(view.fov, eye);
+        }
+        data
     }
 }
 
@@ -205,12 +225,17 @@ impl vr::IVRSystem026_Interface for System {
             )
             .unwrap();
 
+        let (w, h) = self.crop.target_size(
+            views[0].recommended_image_rect_width,
+            views[0].recommended_image_rect_height,
+        );
+        debug!("Recommended eye target after crop: {w} x {h}");
         if !width.is_null() {
-            unsafe { *width = views[0].recommended_image_rect_width };
+            unsafe { *width = w };
         }
 
         if !height.is_null() {
-            unsafe { *height = views[0].recommended_image_rect_height };
+            unsafe { *height = h };
         }
     }
     fn GetProjectionMatrix(&self, eye: vr::EVREye, near_z: f32, far_z: f32) -> vr::HmdMatrix44_t {
@@ -447,8 +472,17 @@ impl vr::IVRSystem026_Interface for System {
             })
             .collect();
 
+        let line_loop = ty == vr::EHiddenAreaMeshType::LineLoop;
+        let vertices = fov_crop::clip_mask(&vertices, line_loop);
         trace!("vertices: {vertices:#?}");
-        let count = vertices.len() / 3;
+        let count = if line_loop {
+            vertices.len()
+        } else {
+            vertices.len() / 3
+        };
+        if count == 0 {
+            return Default::default();
+        }
         // XXX: what are we supposed to do here? pVertexData is a random pointer and there's no
         // clear way for the application to deallocate it
         // fortunately it seems like applications don't call this often, so this leakage isn't a
